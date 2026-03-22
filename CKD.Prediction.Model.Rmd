@@ -1,0 +1,494 @@
+---
+title: "Predicting Chronic Kidney Disease Using Machine Learning: A Comparative Analysis"
+author: "Bhagyesh Vaze"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r, echo=FALSE, message=FALSE}
+library(caret)
+library(randomForest)
+library(e1071)
+library(pROC)
+library(ipred)
+library(glmnet)
+library(corrplot)
+```
+
+
+```{r}
+data <- read.csv("https://drive.google.com/uc?id=1MHp35VxG_NI0R-3_IuO6CCDvjsrtAPf8&export=download")
+
+head(data)
+```
+
+```{r}
+df<- data[-c(1,2), ]
+
+rownames(df) <- NULL
+
+dim(df)
+
+head(df)
+
+str(df)
+```
+
+
+```{r}
+lapply(df, unique)
+```
+
+In this chunk, I mutate and inspect the original dataset. 
+
+```{r Categorical Variable Distribution}
+# Categorical Variable Distribution
+table(df$class)
+table(df$stage)
+```
+
+This chunk explores the distribution of class and stage as they are 2 prominent features.
+
+```{r data tranform}
+numeric_cols <- c("bp..Diastolic.", "bp.limit", "rbc", "pc", "pcc", "ba", "htn", "dm", "cad", "appet", "pe", "ane", "affected")
+df[numeric_cols] <- lapply(df[numeric_cols], as.numeric)
+
+df$class <- as.factor(df$class)
+
+df$stage <- factor(df$stage, levels = c("s1", "s2", "s3", "s4", "s5"), ordered = TRUE)
+
+range_cols <- c("sg", "al", "su", "bgr", "bu", "sod", "sc", "pot", "hemo", "pcv", "rbcc", "wbcc", "grf", "age")
+
+transform_range_to_numeric <- function(x) {
+  # Missing val handling
+  if (is.na(x) || x == "") return(NA)
+  
+  # Range handling
+  if (grepl(" - ", x)) {
+    range_values <- as.numeric(strsplit(x, " - ")[[1]])
+    return(mean(range_values, na.rm = TRUE))
+  }
+  
+  # Handling < value by assuming 90% of the value
+  if (grepl("^< ", x)) {
+    return(as.numeric(gsub("< ", "", x)) * 0.9)  
+  }
+  
+  # Handling ≥ value by assuming 110% of the value
+  if (grepl("^≥ ", x)) {
+    return(as.numeric(gsub("≥ ", "", x)) * 1.1)  
+  }
+  
+  # Stage values handling
+  if (grepl("^s[1-5]$", x)) {
+    return(as.numeric(gsub("s", "", x)))
+  }
+  
+  # Handling "p" in grf column
+  if (x == " p ") return(NA)
+  
+  return(as.numeric(x))
+}
+
+df[range_cols] <- lapply(df[range_cols], function(col) sapply(col, transform_range_to_numeric))
+
+head(df)
+
+str(df)
+```
+
+In this chunk, I have transformed features as per their appropriate category. For the features which had ranges, I chose to use the mean as it is a standard approach to deal with range data. The original data doesn't have missing values but grf has a value named "p" which gets converted to NA while transforming. We impute it in the next chunk.
+
+```{r Missing Value & Imputation}
+colSums(is.na(df))
+
+impute_by_stage <- function(x, stage) {
+  # Median for each stage
+  stage_medians <- tapply(x, stage, median, na.rm = TRUE)
+  
+  # Impute based on resp stage
+  for (s in unique(stage)) {
+    x[is.na(x) & stage == s] <- stage_medians[as.character(s)]
+  }
+  
+  return(x)
+}
+
+df$grf <- impute_by_stage(df$grf, df$stage)
+
+colSums(is.na(df))
+
+```
+I chose to perform stage-based median imputation, as GRF values are directly used to define CKD stages. This approach is the most clinically appropriate, as it maintains the relationship between GRF and disease stage while providing realistic values for the missing data.
+
+```{r Exploratory Data Plots}
+library(ggplot2)
+
+# Distribution of continuous variables 
+ggplot(df, aes(x = age)) + 
+  geom_histogram(bins = 20, fill = "skyblue", color = "black") + 
+  labs(title = "Age Distribution", x = "Age", y = "Frequency")
+
+ggplot(df, aes(x = grf)) + 
+  geom_histogram(bins = 20, fill = "skyblue", color = "black") + 
+  labs(title = "GRF Distribution", x = "GRF", y = "Frequency")
+
+# Boxplot for detecting outliers in continuous features
+ggplot(df, aes(x = class, y = grf)) +
+  geom_boxplot(fill = "lightgreen", color = "black") + 
+  labs(title = "GRF vs Class", x = "Class", y = "GRF")
+
+ggplot(df, aes(x = stage, y = grf)) +
+  geom_boxplot(fill = "lightgreen", color = "black") + 
+  labs(title = "GRF vs Stage", x = "Stage", y = "GRF")
+
+# Pairwise relationships between continuous variables 
+pairs(df[, c("grf", "age", "bgr", "bu", "hemo")], 
+      main = "Pairwise Plots", 
+      col = df$class)
+
+```
+
+From the exploratory data plots, we can intrepret the following:
+
+The age distribution shows a right-skewed pattern with the highest concentration of patients between 50-70 years, peaking around 60-65 years. This suggests the condition primarily affects older adults, though there are cases across all age groups from 20 to 80 years.
+
+The GRF vs Stage box-plot demonstrates a clear negative correlation between disease stage and kidney function (GRF). Stage 1 patients maintain the highest GRF values (around 140), while stages 3-5 show significantly lower values (below 50). This indicates progressive deterioration of kidney function with advancing disease which is logical observation.
+
+The pairwise plot tells us the following:
+
+GRF shows strong negative correlations with blood markers BGR and BU.
+
+Hemoglobin (hemo) levels decline as kidney function (GRF) decreases.
+
+Age has weak correlations with other variables.
+
+Two distinct clusters (black and pink) indicate a clear separation between disease classes.
+
+
+```{r Outlier Detection}
+continuous_cols <- c("sg", "al", "su", "bgr", "bu", "sod", "sc", "pot", 
+                     "hemo", "pcv", "rbcc", "wbcc", "grf", "age") 
+
+detect_outliers <- function(df) {
+  outlier_summary <- lapply(df[, continuous_cols], function(x) {
+    Q1 <- quantile(x, 0.25, na.rm = TRUE)
+    Q3 <- quantile(x, 0.75, na.rm = TRUE)
+    IQR <- Q3 - Q1
+    lower_bound <- Q1 - 1.5 * IQR
+    upper_bound <- Q3 + 1.5 * IQR
+    
+    outliers <- x[x < lower_bound | x > upper_bound]
+    list(
+      num_outliers = length(outliers),
+      percent_outliers = (length(outliers) / length(x)) * 100,
+      lower_bound = lower_bound,
+      upper_bound = upper_bound
+    )
+  })
+  
+  return(outlier_summary)
+}
+outlier_summary <- detect_outliers(df)
+
+outlier_summary
+```
+
+From the outlier analysis on continuous variables, we can determine a few things. al, hemo, and pcv have no outliers. 44.5% of sg values are flagged as outliers, which is significant. This is due to specific gravity having a naturally narrow range, making the IQR method overly sensitive. sc (20.5%) and bu (19.5%) show considerable outlier presence. su (15%), sod (11.5%), and wbcc (8%) have moderate outlier presence. sc and pot have identical lower and upper bounds, indicating near-zero IQR, so the method flags almost any variation. bgr has an unusually high upper bound of 286.3 whereas grf has a lower bound of -74.4, suggesting unrealistic values. This tells us that we are going to need robust transformation to the data which we will implement later
+
+```{r Collinearity analysis}
+library(corrplot)
+library(caret)
+
+correlation_analysis <- function(df) {
+
+  numeric_df <- df[, continuous_cols]
+  
+  cor_matrix <- cor(numeric_df, use = "complete.obs")
+  
+  # highly correlated features (correlation > 0.7)
+  high_cor <- findCorrelation(cor_matrix, cutoff = 0.7)
+  
+  corrplot(cor_matrix, 
+           method = "color",   
+           type = "upper",     
+           addCoef.col = "black", 
+           tl.col = "black",   
+           tl.srt = 45,
+           tl.cex = 0.6,
+           diag = FALSE,       
+           order = "hclust",   
+           number.cex = 0.35)   
+  return(list(
+    correlation_matrix = cor_matrix,
+    highly_correlated_features = colnames(numeric_df)[high_cor]
+  ))
+}
+
+correlation_analysis(df)
+
+```
+
+In this chunk, I performed collinearity analysis by using a correlation matrix and a corrplot on continuous variables only. The highly correlated pairs (above 0.7 cutoff) are hemo and pcv (0.83) and bu and sc (0.87). grf shows moderate negative correlations with bu (-0.42), sc (-0.28), and al (-0.39), which is clinically expected as declining kidney function leads to elevated blood urea and serum creatinine
+
+```{r removing correlated features}
+df <- df[, !(names(df) %in% c("pcv", "sc", "affected", "stage"))]
+
+continuous_cols <- c("sg", "al", "su", "bgr", "bu", "sod", "pot", 
+                     "hemo", "rbcc", "wbcc", "grf", "age")
+```
+
+I removed pcv and sc to reduce multicollinearity (pcv-hemo: 0.83, sc-bu: 0.87), affected because it perfectly maps to the target variable (data leakage), and stage because it is derived from GRF and nearly perfectly separates the classes. This retains the same clinical information through raw biomarkers
+
+```{r chi square}
+# Convert categorical variables to factors
+cat_vars <- c("rbc", "pc", "pcc", "ba", "htn", "dm", "cad", "appet", "pe", "ane")
+df[cat_vars] <- lapply(df[cat_vars], as.factor)
+
+chi_squared_analysis <- function(df) {
+  cat_cols <- sapply(df, is.factor)
+  cat_df <- df[, cat_cols]
+  
+  chi_results <- lapply(names(cat_df)[names(cat_df) != "class"], function(col) {
+    contingency_table <- table(cat_df[[col]], df$class)
+    chi_test <- chisq.test(contingency_table)
+    return(list(
+      feature = col,
+      chi_squared = chi_test$statistic,
+      p_value = chi_test$p.value
+    ))
+  })
+  
+  return(do.call(rbind, chi_results))
+}
+
+chi_squared_analysis(df)
+```
+
+All categorical variables showed statistically significant association with class (all p-values below 0.05). htn had the strongest association (69.4), followed by dm (58.2). ba had the weakest association (5.0, p = 0.025). The warning about chi-squared approximation is due to low expected counts in some contingency table cells, particularly for sparse variables like ba.
+
+```{r Distribution of Evaluation}
+evaluate_distribution <- function(df) {
+  normality_tests <- lapply(df[, continuous_cols], function(x) {
+    test <- shapiro.test(x)
+    return(list(
+      statistic = test$statistic,
+      p_value = test$p.value
+    ))
+  })
+  
+  return(normality_tests)
+}
+
+evaluate_distribution(df)
+```
+
+In this chunk, I use the shapiro-wilk to check the distribution of the data. In this, a W statistic closer to "1" implies that the data may be normally distributed while low p-value (less than 0.05) indicates that the data does not follow a normal distribution. All the variables have extremely low p values indicating a non-normal distribution.
+
+```{r Normalization}
+numeric_df <- df[, continuous_cols]
+
+preprocess_model <- preProcess(numeric_df, 
+                               method = c("BoxCox", "center", "scale"))
+
+df[, continuous_cols] <- predict(preprocess_model, numeric_df)
+
+head(df)
+str(df)
+```
+
+In this chunk, I used Box-Cox transformation to center and scale the 12 continuous features (sg, al, su, bgr, bu, sod, pot, hemo, rbcc, wbcc, grf, age). Binary and categorical variables were excluded from transformation as centering and scaling are not meaningful for them
+
+
+```{r PCA}
+
+pca_result <- prcomp(df[, continuous_cols], center = TRUE, scale. = TRUE)
+
+# Check variance explained
+variance_explained <- cumsum(pca_result$sdev^2 / sum(pca_result$sdev^2))
+num_components <- which(variance_explained >= 0.95)[1]
+
+cat("Components needed for 95% variance:", num_components, "\n")
+
+# Build PCA dataframe with selected components
+pca_df <- as.data.frame(pca_result$x[, 1:num_components])
+
+# Add back categorical variables and target
+cat_vars <- c("rbc", "pc", "pcc", "ba", "htn", "dm", "cad", "appet", 
+              "pe", "ane", "bp..Diastolic.", "bp.limit")
+pca_df <- cbind(pca_df, df[, cat_vars], class = df$class)
+```
+
+I performed PCA on the 12 continuous features. 10 components are needed to explain 95% of the variance. Categorical variables were excluded from PCA and added back to the PCA dataframe alongside the principal components for use in modeling
+
+
+```{r data split}
+set.seed(123)
+train_index <- createDataPartition(pca_df$class, p = 0.75, list = FALSE)
+train_data <- pca_df[train_index, ]
+test_data <- pca_df[-train_index, ]
+```
+
+I chose to split the data in a 75:25 as it is very common and is appropriate for this data-set.
+
+```{r logistic model}
+# Logistic regression with K-fold Cross Validation
+cv_control <- trainControl(method = "cv", number = 10) # 10-fold cross-validation
+
+logistic_model_cv <- train(class ~ ., 
+                           data = train_data, 
+                           method = "glmnet",
+                           family = "binomial",
+                           trControl = cv_control)
+
+print(logistic_model_cv)
+
+logistic_pred_cv <- predict(logistic_model_cv, test_data)
+
+# Confusion matrix 
+conf_matrix_logistic <- confusionMatrix(logistic_pred_cv, test_data$class)
+print(conf_matrix_logistic)
+
+accuracy_logistic <- conf_matrix_logistic$overall['Accuracy']
+precision_logistic <- conf_matrix_logistic$byClass['Pos Pred Value']
+recall_logistic <- conf_matrix_logistic$byClass['Sensitivity']
+f1_score_logistic <- 2 * ((precision_logistic * recall_logistic) / (precision_logistic + recall_logistic))
+
+cat("Logistic Regression Accuracy: ", accuracy_logistic, "\n")
+cat("Logistic Regression F1-Score: ", f1_score_logistic, "\n")
+```
+
+The model correctly identifies 30 true positives (ckd) and 17 true negatives (notckd), with only 2 false negatives and 1 false positive. The accuracy of 94% is statistically significant compared to the No Information Rate (NIR = 0.64), confirmed by a p-value of 7.955e-07. The F1 score of 0.95 indicates strong balance between precision and recall
+
+
+```{r rf model}
+rf_model <- train(class ~ ., data = train_data, method = "rf", 
+                  trControl = trainControl(method = "cv", number = 10), 
+                  tuneGrid = expand.grid(mtry = c(2, 5, 10)))
+
+print(rf_model)
+
+rf_pred <- predict(rf_model, newdata = test_data)
+
+conf_matrix_rf <- confusionMatrix(rf_pred, test_data$class)
+print(conf_matrix_rf)
+
+accuracy_rf <- conf_matrix_rf$overall['Accuracy']
+precision_rf <- conf_matrix_rf$byClass['Pos Pred Value']
+recall_rf <- conf_matrix_rf$byClass['Sensitivity']
+f1_score_rf <- 2 * ((precision_rf * recall_rf) / (precision_rf + recall_rf))
+
+cat("Random Forest Accuracy: ", accuracy_rf, "\n")
+cat("Random Forest F1-Score: ", f1_score_rf, "\n")
+```
+
+Random Forest with 10-fold cross-validation selected mtry = 5 as optimal. The model achieves 92% accuracy with an F1 score of 0.94. It correctly identifies 30 true positives and 16 true negatives, with 2 false positives and 2 false negatives. Cross-validation accuracy peaked at 98% for mtry = 5, suggesting the model generalizes well.
+
+```{r svm model}
+# SVM with K-fold Cross Validation
+svm_model <- train(class ~ ., 
+                   data = train_data, 
+                   method = "svmLinear",
+                   trControl = trainControl(method = "cv", number = 10),  
+                   tuneLength = 5) 
+
+print(svm_model)
+
+# Predictions
+svm_pred <- predict(svm_model, test_data)
+
+# Confusion matrix
+conf_matrix_svm <- confusionMatrix(svm_pred, test_data$class)
+print(conf_matrix_svm)
+
+# Accuracy and F1-Score
+accuracy_svm <- conf_matrix_svm$overall['Accuracy']
+precision_svm <- conf_matrix_svm$byClass['Pos Pred Value']
+recall_svm <- conf_matrix_svm$byClass['Sensitivity']
+f1_score_svm <- 2 * ((precision_svm * recall_svm) / (precision_svm + recall_svm))
+
+cat("SVM Accuracy: ", accuracy_svm, "\n")
+cat("SVM F1-Score: ", f1_score_svm, "\n")
+```
+
+```{r Hyperparameter tuning}
+# Hyperparameter tuning for SVM
+svm_tune_grid <- expand.grid(C = c(0.1, 1, 10), # Cost values to test
+                             sigma = c(0.01, 0.1, 1))  # Sigma values for radial kernel
+
+svm_tuned <- train(class ~ ., 
+                   data = train_data, 
+                   method = "svmRadial",  
+                   trControl = trainControl(method = "cv", number = 10), 
+                   tuneGrid = svm_tune_grid)
+
+print(svm_tuned)
+```
+SVM with linear kernel achieves 92% accuracy and an F1 score of 0.93 using 10-fold cross-validation. The model has perfect specificity (no false positives) but misses 4 CKD cases (false negatives), suggesting it is conservative in predicting CKD.
+
+```{r}
+# Tuned SVM predictions
+svm_tuned_pred <- predict(svm_tuned, test_data)
+
+conf_matrix_svm_tuned <- confusionMatrix(svm_tuned_pred, test_data$class)
+print(conf_matrix_svm_tuned)
+
+accuracy_svm_tuned <- conf_matrix_svm_tuned$overall['Accuracy']
+precision_svm_tuned <- conf_matrix_svm_tuned$byClass['Pos Pred Value']
+recall_svm_tuned <- conf_matrix_svm_tuned$byClass['Sensitivity']
+f1_score_svm_tuned <- 2 * ((precision_svm_tuned * recall_svm_tuned) / (precision_svm_tuned + recall_svm_tuned))
+
+cat("Tuned SVM Accuracy: ", accuracy_svm_tuned, "\n")
+cat("Tuned SVM F1-Score: ", f1_score_svm_tuned, "\n")
+```
+I tuned the SVM using a radial basis function kernel with a grid search over C (0.1, 1, 10) and sigma (0.01, 0.1, 1). The optimal parameters were C = 10 and sigma = 0.01, achieving 97.3% cross-validation accuracy. On the test set, the tuned model improved to 94% accuracy and F1 of 0.95, reducing false negatives from 4 to 3 while maintaining perfect specificity.
+
+```{r model comparisons}
+comparison_results <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "SVM Linear", "SVM Radial (Tuned)"),
+  Accuracy = c(accuracy_logistic, accuracy_rf, accuracy_svm, accuracy_svm_tuned),
+  F1_Score = c(f1_score_logistic, f1_score_rf, f1_score_svm, f1_score_svm_tuned)
+)
+comparison_results
+```
+The comparison table summarizes accuracy and F1 scores across all models. Logistic Regression and Tuned SVM Radial both achieve the highest test accuracy at 94%, while Random Forest and Linear SVM both score 92%.
+
+```{r ensemble}
+# Predictions from existing models
+pred_logistic <- predict(logistic_model_cv, test_data)
+pred_rf <- predict(rf_model, test_data)
+pred_svm <- predict(svm_tuned, test_data)
+
+# Majority voting
+votes <- data.frame(pred_logistic, pred_rf, pred_svm)
+ensemble_pred <- apply(votes, 1, function(row) {
+  names(sort(table(row), decreasing = TRUE))[1]
+})
+ensemble_pred <- factor(ensemble_pred, levels = c("ckd", "notckd"))
+
+# Evaluation
+ensemble_cm <- confusionMatrix(ensemble_pred, test_data$class)
+print(ensemble_cm)
+
+accuracy_ensemble <- ensemble_cm$overall['Accuracy']
+precision_ensemble <- ensemble_cm$byClass['Pos Pred Value']
+recall_ensemble <- ensemble_cm$byClass['Sensitivity']
+f1_ensemble <- 2 * ((precision_ensemble * recall_ensemble) / (precision_ensemble + recall_ensemble))
+
+cat("Ensemble Accuracy: ", accuracy_ensemble, "\n")
+cat("Ensemble F1-Score: ", f1_ensemble, "\n")
+```
+```{r}
+
+comparison_results <- rbind(
+  comparison_results,
+  data.frame(
+    Model = "Ensemble (Majority Vote)",
+    Accuracy = accuracy_ensemble,
+    F1_Score = f1_ensemble
+  )
+)
+print(comparison_results)
+```
+
